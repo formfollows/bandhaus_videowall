@@ -17,3 +17,5 @@ gst-launch-1.0 --version
 
 
 python3 -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; Gst.init(None); print(Gst.version_string())"
+
+source .venv/bin/activate

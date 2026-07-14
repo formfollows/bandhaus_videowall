@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 from contextlib import asynccontextmanager
 
@@ -8,15 +9,17 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 gi.require_version("Gst", "1.0")
-from gi.repository import GLib, Gst
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib, Gst
 
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 Gst.init(None)
 
 CAMERAS = {
-    "cam1": "rtsp://127.0.0.1:8554/cam1",
-    "cam2": "rtsp://127.0.0.1:8554/cam2",
-    "cam3": "rtsp://127.0.0.1:8554/cam3",
+    "iphone": "srt://0.0.0.0:6001?mode=listener",
 }
 
 
@@ -50,9 +53,9 @@ class VideoSwitcher:
         self.selector_pads: dict[str, Gst.Pad] = {}
 
         for name, url in sources.items():
-            self._add_rtsp_source(name, url)
+            self._add_source(name, url)
 
-    def _add_rtsp_source(self, name: str, url: str) -> None:
+    def _add_source(self, name: str, url: str) -> None:
         source = Gst.ElementFactory.make("uridecodebin", f"source-{name}")
         queue = Gst.ElementFactory.make("queue", f"queue-{name}")
         convert = Gst.ElementFactory.make("videoconvert", f"convert-{name}")
@@ -90,6 +93,16 @@ class VideoSwitcher:
 
         self.selector_pads[name] = selector_pad
 
+        def on_caller_added(_element: Gst.Element, _sock_id: int, address) -> None:
+            host = address.get_address().to_string()
+            logger.info("Source '%s' connected from %s:%d", name, host, address.get_port())
+
+        def on_source_setup(_element: Gst.Element, source_element: Gst.Element) -> None:
+            try:
+                source_element.connect("caller-added", on_caller_added)
+            except TypeError:
+                pass
+
         def on_pad_added(element: Gst.Element, pad: Gst.Pad) -> None:
             sink_pad = queue.get_static_pad("sink")
 
@@ -97,12 +110,12 @@ class VideoSwitcher:
                 return
 
             caps = pad.get_current_caps() or pad.query_caps(None)
-            structure = caps.get_structure(0)
-            media_type = structure.get_name()
 
-            if media_type.startswith("video/"):
+            if caps.to_string().startswith("video/"):
+                logger.info("Source '%s' streaming (%s)", name, caps.to_string())
                 pad.link(sink_pad)
 
+        source.connect("source-setup", on_source_setup)
         source.connect("pad-added", on_pad_added)
 
     def start(self) -> None:
