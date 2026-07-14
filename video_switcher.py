@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import gi
+from pydantic import BaseModel
 
 gi.require_version("Gst", "1.0")
 gi.require_version("Gio", "2.0")
@@ -14,60 +16,134 @@ logger = logging.getLogger(__name__)
 Gst.init(None)
 
 
+class VideoSettings(BaseModel):
+    sources: dict[str, str] = {}
+
+    # Auf einem Raspberry Pi oder Wayland-System gegebenenfalls ersetzen,
+    # z. B. durch kmssink, waylandsink oder glimagesink.
+    sink: str = "autovideosink"
+    width: int = 1920
+    height: int = 1080
+    framerate: int = 30
+
+    screenshot_path: str = "screenshot.png"
+    screenshot_interval: int = 10
+
+    @property
+    def caps(self) -> Gst.Caps:
+        return Gst.Caps.from_string(
+            f"video/x-raw,width={self.width},height={self.height},"
+            f"framerate={self.framerate}/1"
+        )
+
+
 class VideoSwitcher:
-    def __init__(self, sources: dict[str, str]) -> None:
+    def __init__(self, settings: VideoSettings | None = None) -> None:
+        self.settings = settings or VideoSettings()
+
         self.pipeline = Gst.Pipeline.new("video-switcher")
         self.selector = Gst.ElementFactory.make("input-selector", "selector")
         self.convert = Gst.ElementFactory.make("videoconvert", "output-convert")
+        self.tee = Gst.ElementFactory.make("tee", "output-tee")
+        self.display_queue = Gst.ElementFactory.make("queue", "display-queue")
+        self.sink = Gst.ElementFactory.make(self.settings.sink, "video-output")
 
-        # Auf einem Raspberry Pi oder Wayland-System gegebenenfalls ersetzen,
-        # z. B. durch kmssink, waylandsink oder glimagesink.
-        self.sink = Gst.ElementFactory.make("autovideosink", "video-output")
+        self.screenshot_queue = Gst.ElementFactory.make("queue", "screenshot-queue")
+        self.screenshot_convert = Gst.ElementFactory.make("videoconvert", "screenshot-convert")
+        self.screenshot_capsfilter = Gst.ElementFactory.make("capsfilter", "screenshot-caps")
+        self.screenshot_sink = Gst.ElementFactory.make("appsink", "screenshot-sink")
 
-        if not all((self.pipeline, self.selector, self.convert, self.sink)):
+        elements = (
+            self.pipeline,
+            self.selector,
+            self.convert,
+            self.tee,
+            self.display_queue,
+            self.sink,
+            self.screenshot_queue,
+            self.screenshot_convert,
+            self.screenshot_capsfilter,
+            self.screenshot_sink,
+        )
+
+        if not all(elements):
             raise RuntimeError("Benötigte GStreamer-Elemente fehlen")
 
-        self.pipeline.add(self.selector)
-        self.pipeline.add(self.convert)
-        self.pipeline.add(self.sink)
+        self.screenshot_capsfilter.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw,format=RGB")
+        )
+        self.screenshot_sink.set_property("emit-signals", False)
+        self.screenshot_sink.set_property("sync", False)
+        self.screenshot_sink.set_property("max-buffers", 1)
+        self.screenshot_sink.set_property("drop", True)
+
+        for element in elements[1:]:
+            self.pipeline.add(element)
 
         if not self.selector.link(self.convert):
             raise RuntimeError("Selector konnte nicht verbunden werden")
 
-        if not self.convert.link(self.sink):
+        if not self.convert.link(self.tee):
+            raise RuntimeError("Tee konnte nicht verbunden werden")
+
+        if not self.tee.link(self.display_queue) or not self.display_queue.link(self.sink):
             raise RuntimeError("Videoausgabe konnte nicht verbunden werden")
 
-        self.selector_pads: dict[str, Gst.Pad] = {}
+        if (
+            not self.tee.link(self.screenshot_queue)
+            or not self.screenshot_queue.link(self.screenshot_convert)
+            or not self.screenshot_convert.link(self.screenshot_capsfilter)
+            or not self.screenshot_capsfilter.link(self.screenshot_sink)
+        ):
+            raise RuntimeError("Screenshot-Zweig konnte nicht verbunden werden")
 
-        for name, url in sources.items():
+        self.selector_pads: dict[str, Gst.Pad] = {}
+        self._screenshot_timer_id: int | None = None
+
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_bus_error)
+        bus.connect("message::warning", self._on_bus_warning)
+
+        for name, url in self.settings.sources.items():
             self._add_source(name, url)
+
+    @staticmethod
+    def _on_bus_error(_bus: Gst.Bus, message: Gst.Message) -> None:
+        err, debug = message.parse_error()
+        logger.error("GStreamer-Fehler von %s: %s (%s)", message.src.get_name(), err.message, debug)
+
+    @staticmethod
+    def _on_bus_warning(_bus: Gst.Bus, message: Gst.Message) -> None:
+        warn, debug = message.parse_warning()
+        logger.warning("GStreamer-Warnung von %s: %s (%s)", message.src.get_name(), warn.message, debug)
 
     def _add_source(self, name: str, url: str) -> None:
         source = Gst.ElementFactory.make("uridecodebin", f"source-{name}")
         queue = Gst.ElementFactory.make("queue", f"queue-{name}")
         convert = Gst.ElementFactory.make("videoconvert", f"convert-{name}")
         scale = Gst.ElementFactory.make("videoscale", f"scale-{name}")
+        rate = Gst.ElementFactory.make("videorate", f"rate-{name}")
         capsfilter = Gst.ElementFactory.make("capsfilter", f"caps-{name}")
 
-        if not all((source, queue, convert, scale, capsfilter)):
+        if not all((source, queue, convert, scale, rate, capsfilter)):
             raise RuntimeError(f"Elemente für {name} konnten nicht erstellt werden")
 
         source.set_property("uri", url)
 
         # Alle Eingänge werden auf dasselbe Format normalisiert.
-        capsfilter.set_property(
-            "caps",
-            Gst.Caps.from_string(
-                "video/x-raw,width=1920,height=1080,framerate=30/1"
-            ),
-        )
+        # videorate wird benötigt, da Quellen mit variabler Framerate (z. B.
+        # framerate=0/1 von einer iPhone-Kamera) sonst nicht auf die feste
+        # framerate der Ziel-Caps negotiaten können.
+        capsfilter.set_property("caps", self.settings.caps)
 
-        for element in (source, queue, convert, scale, capsfilter):
+        for element in (source, queue, convert, scale, rate, capsfilter):
             self.pipeline.add(element)
 
         queue.link(convert)
         convert.link(scale)
-        scale.link(capsfilter)
+        scale.link(rate)
+        rate.link(capsfilter)
 
         selector_pad = self.selector.request_pad_simple("sink_%u")
         source_pad = capsfilter.get_static_pad("src")
@@ -123,8 +199,55 @@ class VideoSwitcher:
         if result == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("GStreamer-Pipeline konnte nicht starten")
 
+        self._screenshot_timer_id = GLib.timeout_add_seconds(
+            self.settings.screenshot_interval, self._capture_screenshot
+        )
+
     def stop(self) -> None:
+        if self._screenshot_timer_id is not None:
+            GLib.source_remove(self._screenshot_timer_id)
+            self._screenshot_timer_id = None
+
         self.pipeline.set_state(Gst.State.NULL)
+
+    def _capture_screenshot(self) -> bool:
+        sample = self.screenshot_sink.emit("try-pull-sample", Gst.SECOND)
+
+        if sample is None:
+            logger.info("Screenshot übersprungen: kein Frame verfügbar (Quelle aktiv?)")
+            return True
+
+        path = os.path.abspath(self.settings.screenshot_path)
+
+        try:
+            self._write_png(sample, path)
+        except Exception:
+            logger.exception("Screenshot konnte nicht geschrieben werden: %s", path)
+        else:
+            logger.info("Screenshot gespeichert unter %s", path)
+
+        return True
+
+    @staticmethod
+    def _write_png(sample: Gst.Sample, path: str) -> None:
+        encode_pipeline = Gst.parse_launch(
+            "appsrc name=src format=time ! pngenc ! filesink name=sink"
+        )
+        appsrc = encode_pipeline.get_by_name("src")
+        filesink = encode_pipeline.get_by_name("sink")
+
+        appsrc.set_property("caps", sample.get_caps())
+        filesink.set_property("location", path)
+
+        encode_pipeline.set_state(Gst.State.PLAYING)
+        appsrc.emit("push-buffer", sample.get_buffer())
+        appsrc.emit("end-of-stream")
+
+        bus = encode_pipeline.get_bus()
+        bus.timed_pop_filtered(
+            Gst.CLOCK_TIME_NONE, Gst.MessageType.EOS | Gst.MessageType.ERROR
+        )
+        encode_pipeline.set_state(Gst.State.NULL)
 
     def switch(self, name: str) -> None:
         pad = self.selector_pads.get(name)

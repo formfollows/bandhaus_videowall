@@ -1,0 +1,4 @@
+- buttons
+- h265
+- video switcher
+- test mode, screenshot endpoint (png is now written periodically, needs HTTP endpoint)

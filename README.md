@@ -8,14 +8,16 @@ A GStreamer-based video switcher for RTSP camera sources, controlled over a smal
 - The selector's output goes through `videoconvert` into a video sink (`autovideosink` by default).
 - A background GLib main loop drives the GStreamer pipeline while FastAPI serves API requests on the main thread.
 
-Cameras are currently defined in `server.py`:
+Cameras and pipeline settings are defined in `server.py` via `VideoSettings`:
 
 ```python
-CAMERAS = {
-    "cam1": "rtsp://127.0.0.1:8554/cam1",
-    "cam2": "rtsp://127.0.0.1:8554/cam2",
-    "cam3": "rtsp://127.0.0.1:8554/cam3",
-}
+VIDEO_SETTINGS = VideoSettings(
+    sources={
+        "cam1": "rtsp://127.0.0.1:8554/cam1",
+        "cam2": "rtsp://127.0.0.1:8554/cam2",
+        "cam3": "rtsp://127.0.0.1:8554/cam3",
+    },
+)
 ```
 
 ## Requirements
@@ -56,7 +58,7 @@ python3 server.py
 
 The API listens on `0.0.0.0:8000`.
 
-> On a Raspberry Pi or a Wayland session, replace `autovideosink` in `VideoSwitcher.__init__` with a sink appropriate for the display (e.g. `kmssink`, `waylandsink`, or `glimagesink`).
+> On a Raspberry Pi or a Wayland session, set `VideoSettings(sink=...)` to a sink appropriate for the display (e.g. `kmssink`, `waylandsink`, or `glimagesink`).
 
 ## API
 

@@ -11,21 +11,23 @@ from pydantic import BaseModel
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib
 
-from video_switcher import VideoSwitcher
+from video_switcher import VideoSettings, VideoSwitcher
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-CAMERAS = {
-    "iphone": "srt://0.0.0.0:6001?mode=listener",
-}
+VIDEO_SETTINGS = VideoSettings(
+    sources={
+        "iphone": "srt://0.0.0.0:6001?mode=listener",
+    },
+)
 
 
 class SwitchRequest(BaseModel):
     source: str
 
 
-switcher = VideoSwitcher(CAMERAS)
+switcher = VideoSwitcher(VIDEO_SETTINGS)
 glib_loop = GLib.MainLoop()
 
 
@@ -46,7 +48,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/sources")
 def list_sources() -> dict:
-    return {"sources": list(CAMERAS)}
+    return {"sources": list(VIDEO_SETTINGS.sources)}
 
 
 @app.put("/program")
