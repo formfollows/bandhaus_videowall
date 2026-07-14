@@ -1,11 +1,12 @@
 # licht
 
-A GStreamer-based video switcher for RTSP camera sources, controlled over a small FastAPI HTTP API. It builds a live pipeline with an `input-selector` so the active camera can be switched at runtime without restarting playback.
+A GStreamer-based video switcher for camera sources, controlled over a small FastAPI HTTP API. It builds a live pipeline with an `input-selector` so the active camera can be switched at runtime without restarting playback.
 
 ## How it works
 
-- Each configured RTSP source is decoded (`uridecodebin`), normalized to a common format (1920x1080@30fps), and fed into a shared `input-selector`.
-- The selector's output goes through `videoconvert` into a video sink (`autovideosink` by default).
+- Each configured source (any URI scheme `uridecodebin` supports — RTSP, SRT, etc.) is decoded, normalized to a common format (1920x1080@30fps by default, via `videoconvert` / `videoscale` / `videorate`), and fed into a shared `input-selector`. `videorate` is required because live sources (e.g. a phone camera) often report a variable framerate (`framerate=0/1`), which otherwise fails to negotiate against the fixed output caps.
+- The selector's output is split with a `tee`: one branch goes through `videoconvert` into a video sink (`autovideosink` by default), the other periodically feeds a screenshot capture branch (see below).
+- Connects and disconnects on listener-mode sources (e.g. SRT) are logged, along with any GStreamer pipeline errors/warnings.
 - A background GLib main loop drives the GStreamer pipeline while FastAPI serves API requests on the main thread.
 
 Cameras and pipeline settings are defined in `server.py` via `VideoSettings`:
@@ -19,6 +20,17 @@ VIDEO_SETTINGS = VideoSettings(
     },
 )
 ```
+
+`VideoSettings` fields:
+
+| Field                | Default              | Description                                                    |
+| --------------------- | -------------------- | ---------------------------------------------------------------- |
+| `sources`             | `{}`                 | Map of source name to URI                                       |
+| `sink`                | `"autovideosink"`    | Output sink (e.g. `kmssink`, `waylandsink`, `glimagesink`)      |
+| `width` / `height`    | `1920` / `1080`      | Normalized output resolution                                    |
+| `framerate`           | `30`                 | Normalized output framerate                                     |
+| `screenshot_path`     | `"screenshot.png"`   | Where periodic screenshots are written (overwritten in place)   |
+| `screenshot_interval` | `10`                 | Seconds between screenshot captures                             |
 
 ## Requirements
 
@@ -89,3 +101,9 @@ curl -X PUT http://localhost:8000/program \
 ```
 
 Returns `404` if the requested source name isn't configured.
+
+## Screenshots
+
+Every `screenshot_interval` seconds, the currently active program output is captured and written as a PNG to `screenshot_path` (the file is overwritten in place). If no source is currently streaming into the active pad, the capture is skipped and logged (`Screenshot übersprungen: kein Frame verfügbar`).
+
+There is no HTTP endpoint to fetch the screenshot yet — see `TODO.md`.
