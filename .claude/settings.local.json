@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//sys/firmware/devicetree/base/**)",
+      "Bash(lscpu)",
+      "Bash(ip -br addr show)",
+      "Bash(ip route *)",
+      "Bash(dpkg -l)",
+      "Bash(apt-cache policy *)",
+      "Bash(apt-cache search *)",
+      "Bash(python3 -m venv --help)",
+      "Bash(python3 -m pip --version)",
+      "Bash(python3 -c \"import fastapi\")",
+      "Bash(python3 -c \"import uvicorn\")",
+      "Bash(python3 -c \"import gi; gi.require_version\\('Gst','1.0'\\); from gi.repository import Gst; Gst.init\\(None\\); print\\(Gst.version_string\\(\\)\\)\")",
+      "Read(//home/raf/**)",
+      "Bash(git --version)",
+      "Bash(dpkg -L gstreamer1.0-plugins-bad)",
+      "Bash(dpkg -L gstreamer1.0-plugins-good)",
+      "Bash(dpkg -L gstreamer1.0-plugins-base)",
+      "Bash(dpkg -L gstreamer1.0-gl)",
+      "Bash(dpkg -L gstreamer1.0-x)",
+      "Bash(dpkg -L gstreamer1.0-libav)",
+      "Bash(dpkg -L libgstreamer1.0-0)",
+      "Bash(sudo apt update)"
+    ]
+  }
+}
