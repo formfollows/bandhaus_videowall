@@ -24,6 +24,9 @@ wheels/
 .installed.cfg
 *.egg
 
+
+videos/
+
 # Unit test / coverage reports
 htmlcov/
 .tox/

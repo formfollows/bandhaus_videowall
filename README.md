@@ -2,6 +2,16 @@
 
 A GStreamer-based video switcher for SRT camera sources (e.g. an iPhone streaming app), controlled over a small FastAPI HTTP API. It builds a live pipeline with an `input-selector` so the active camera can be switched at runtime without restarting playback.
 
+## Setup example
+
+Five cameras positioned around a stage each stream over SRT to a Raspberry Pi running this project, which switches between them and outputs the composed live picture over a video cable to an outdoor screen:
+
+![Bühne & Kamerapositionen](res/schema.PNG)
+
+The result, running at an outdoor event:
+
+![Outdoor-Leinwand mit Live-Bild](res/outdoor.PNG)
+
 ## How it works
 
 - Each configured source is an SRT listener with a fixed decode chain — `srtsrc` (listener mode) → `tsdemux` → `h265parse` → `v4l2slh265dec` (hardware-accelerated stateless HEVC decode) — rather than `uridecodebin`, so it never falls back to a software H265 decoder.
@@ -10,7 +20,8 @@ A GStreamer-based video switcher for SRT camera sources (e.g. an iPhone streamin
 - All queues are low-latency (`leaky=downstream`, small `max-size-buffers`) so a network hiccup or decoder stall gets shed instead of building up an ever-growing backlog.
 - Connects/disconnects on each SRT listener source, per-source SRT stats (every 5s), pipeline latency recalculations, and any GStreamer pipeline errors/warnings are all logged.
 - A source whose URL isn't `srt://` is treated as a local video file (e.g. an `.mp4`) and played back with `uridecodebin` → the same normalization chain → the shared `input-selector`, so it can be switched to/from just like a camera. Unlike the SRT branch, the codec isn't known ahead of time, so it's autoplugged rather than pinned to a specific decoder. Any non-video pad (e.g. audio) is drained into a `fakesink` so it doesn't stall the decoder. A dedicated `identity sync=true` element paces this branch to real time — the shared sink runs with `sync=false` (see below), so without it a file would decode and play back as fast as the CPU allows.
-- File sources only play while selected as the program source: they start paused (`locked-state` + `PAUSED`) and are only unlocked and set to `PLAYING` — seeked back to `0` first — by `switch()` when selected; switching away pauses and re-locks them. While selected, reaching end-of-stream loops the file rather than ending it: EOS is caught on the source's own output pad (a pad probe, not a bus watch) and dropped, and the `uridecodebin` is seeked back to `0` via `GLib.idle_add` (the seek can't run synchronously from inside the probe — that's the source's own streaming thread, which the seek's flush needs to proceed, so a direct call there would deadlock).
+- This Pi model only has a hardware decoder for HEVC (`v4l2slh265dec`, the same one the SRT branch uses), not H.264 — an H.264 file falls back to (much heavier) software decoding. Encode file sources as H.265, ideally already at the target resolution/framerate (see `width`/`height`/`framerate` above), e.g. `ffmpeg -i in.mp4 -vf "scale=1280:720,fps=30" -c:v libx265 -an out.mp4`. Unlike the SRT branch's concern about `uridecodebin` autoplugging a software H.265 decoder, this turned out to be a non-issue in practice: `v4l2slh265dec` has a higher GStreamer element rank than `avdec_h265`, so `uridecodebin` picks it automatically (verified via `GST_DEBUG=GST_ELEMENT_FACTORY:5`).
+- File sources only play while selected as the program source: they stay in `NULL` (`locked-state`, no open device, no buffers held) until `switch()` unlocks and sets them to `PLAYING`; switching away tears them back down to `NULL` and re-locks them. This isn't just a memory optimization — the Pi's HEVC decoder can only run a limited number of concurrent hardware sessions, and the two SRT cameras already occupy one each, so releasing a file source's decoder when it's not on air matters. Since each selection rebuilds the decode chain from scratch, playback always starts from `0`, no explicit seek needed. While selected, reaching end-of-stream loops the file rather than ending it: EOS is caught on the source's own output pad (a pad probe, not a bus watch) and dropped, and the `uridecodebin` is seeked back to `0` via `GLib.idle_add` (the seek can't run synchronously from inside the probe — that's the source's own streaming thread, which the seek's flush needs to proceed, so a direct call there would deadlock).
 - A background GLib main loop drives the GStreamer pipeline while FastAPI serves API requests on the main thread.
 
 Cameras and pipeline settings are defined in `server.py` via `VideoSettings`:

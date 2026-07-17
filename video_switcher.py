@@ -315,13 +315,14 @@ class VideoSwitcher:
         self._file_sources[name] = decodebin
 
         # Datei-Quellen sollen nur laufen, während sie als Programm-Quelle
-        # ausgewählt sind. Der Zweig wird deshalb standardmäßig pausiert und
-        # von automatischen Pipeline-weiten Zustandswechseln abgekoppelt
-        # (locked-state) - switch() übernimmt Freigabe/Pause beim Umschalten.
-        # Falls diese Quelle der initial aktive Selector-Pad ist, wird das
-        # am Ende von __init__ wieder rückgängig gemacht.
+        # ausgewählt sind. Der Zweig bleibt deshalb standardmäßig in NULL
+        # (keine geöffneten Geräte/Puffer im Speicher, kein belegter
+        # Hardware-Decoder-Slot) und von automatischen Pipeline-weiten
+        # Zustandswechseln abgekoppelt (locked-state) - switch() übernimmt
+        # Start/Stop beim Umschalten. Falls diese Quelle der initial aktive
+        # Selector-Pad ist, wird das am Ende von __init__ wieder rückgängig
+        # gemacht.
         decodebin.set_locked_state(True)
-        decodebin.set_state(Gst.State.PAUSED)
 
         # Datei-Quellen sind endlich: statt die Wiedergabe am EOS enden zu
         # lassen (was, wenn diese Quelle gerade aktiv ist, über den Selector
@@ -463,16 +464,22 @@ class VideoSwitcher:
             previous_element = self._file_sources.get(previous) if previous else None
 
             if previous_element is not None:
-                previous_element.set_state(Gst.State.PAUSED)
+                # NULL statt nur PAUSED: schließt das v4l2-Decoder-Gerät und
+                # gibt dessen Puffer wieder frei, statt sie nur ruhen zu
+                # lassen. Wichtig auf diesem Pi, da RAM knapp ist und die
+                # Hardware ohnehin nur begrenzt viele gleichzeitige
+                # HEVC-Decode-Sessions erlaubt (die beiden SRT-Kameras
+                # belegen bereits je eine).
+                previous_element.set_state(Gst.State.NULL)
                 previous_element.set_locked_state(True)
 
             new_element = self._file_sources.get(name)
 
             if new_element is not None:
+                # Kein expliziter seek_simple nötig: aus NULL heraus baut
+                # decodebin die Decode-Kette komplett neu auf und beginnt
+                # ohnehin bei Position 0.
                 new_element.set_locked_state(False)
-                new_element.seek_simple(
-                    Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0
-                )
                 new_element.set_state(Gst.State.PLAYING)
 
         return GLib.SOURCE_REMOVE
