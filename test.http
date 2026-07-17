@@ -1,0 +1,34 @@
+@host = http://localhost:8000
+
+### Liste verfügbarer Videoquellen
+GET {{host}}/sources HTTP/1.1
+
+###
+
+### Auf iPhone-Quelle umschalten
+PUT {{host}}/program HTTP/1.1
+content-type: application/json
+
+{
+    "source": "iphone"
+}
+
+###
+
+### Auf iPad-Quelle umschalten
+PUT {{host}}/program HTTP/1.1
+content-type: application/json
+
+{
+    "source": "ipad"
+}
+
+###
+
+### Fehlerfall: unbekannte Quelle (erwartet 404)
+PUT {{host}}/program HTTP/1.1
+content-type: application/json
+
+{
+    "source": "unbekannt"
+}

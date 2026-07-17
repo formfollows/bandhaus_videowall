@@ -1,4 +1,4 @@
-- multi video (ipad)
+- ~~multi video (ipad)~~ (zweite Quelle "ipad" auf Port 6002 in server.py ergänzt)
 - umschalt
 - disconnect / reconnect
 - stream image oder video 

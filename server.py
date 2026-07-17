@@ -23,6 +23,7 @@ VIDEO_SETTINGS = VideoSettings(
         # iPhone streaming app) requests, so lowering this only helps if the
         # sender isn't already asking for more.
         "iphone": "srt://0.0.0.0:6001?mode=listener&latency=120",
+        "ipad": "srt://0.0.0.0:6002?mode=listener&latency=120",
     },
     # Direct KMS/DRM output; avoids autovideosink guessing a GL/Wayland sink
     # that isn't available on a headless console.
