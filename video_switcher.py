@@ -15,12 +15,9 @@ logger = logging.getLogger(__name__)
 
 Gst.init(None)
 
-
 class VideoSettings(BaseModel):
     sources: dict[str, str] = {}
 
-    # Auf einem Raspberry Pi oder Wayland-System gegebenenfalls ersetzen,
-    # z. B. durch kmssink, waylandsink oder glimagesink.
     sink: str = "kmssink"
     width: int = 1280
     height: int = 720
