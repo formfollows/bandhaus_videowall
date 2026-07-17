@@ -9,6 +9,7 @@ A GStreamer-based video switcher for SRT camera sources (e.g. an iPhone streamin
 - The selector's output is split with a `tee`: one branch goes through `videoconvert` into a video sink (`kmssink` by default, for direct KMS/DRM output on a headless console), the other feeds an `appsink`-based screenshot capture branch (see below). `sync` is forced off on the sink, since a live SRT source can drift enough against the pipeline clock that `kmssink`'s default `sync=true` never releases a frame.
 - All queues are low-latency (`leaky=downstream`, small `max-size-buffers`) so a network hiccup or decoder stall gets shed instead of building up an ever-growing backlog.
 - Connects/disconnects on each SRT listener source, per-source SRT stats (every 5s), pipeline latency recalculations, and any GStreamer pipeline errors/warnings are all logged.
+- A source whose URL isn't `srt://` is treated as a local video file (e.g. an `.mp4`) and played back with `uridecodebin` → the same normalization chain → the shared `input-selector`, so it can be switched to/from just like a camera. Unlike the SRT branch, the codec isn't known ahead of time, so it's autoplugged rather than pinned to a specific decoder. The file loops indefinitely: end-of-stream is caught on the source's own output pad (a pad probe, not a bus watch) and dropped, and the `uridecodebin` is seeked back to `0` — this works whether the file is currently the active source or just looping unseen in the background. Any non-video pad (e.g. audio) is drained into a `fakesink` so it doesn't stall the decoder.
 - A background GLib main loop drives the GStreamer pipeline while FastAPI serves API requests on the main thread.
 
 Cameras and pipeline settings are defined in `server.py` via `VideoSettings`:
@@ -17,6 +18,7 @@ Cameras and pipeline settings are defined in `server.py` via `VideoSettings`:
 VIDEO_SETTINGS = VideoSettings(
     sources={
         "iphone": "srt://0.0.0.0:6001?mode=listener&latency=120",
+        "bumper": "videos/bumper.mp4",
     },
     sink="kmssink",
 )
@@ -26,7 +28,7 @@ VIDEO_SETTINGS = VideoSettings(
 
 | Field                | Default              | Description                                                              |
 | --------------------- | -------------------- | -------------------------------------------------------------------------- |
-| `sources`             | `{}`                 | Map of source name to SRT URI (`srt://...?mode=listener&...`)             |
+| `sources`             | `{}`                 | Map of source name to either an SRT URI (`srt://...?mode=listener&...`) or a local video file path/`file://` URI, which loops |
 | `sink`                | `"kmssink"`           | Output sink (e.g. `kmssink`, `waylandsink`, `glimagesink`)                |
 | `width` / `height`    | `1280` / `720`        | Normalized output resolution                                             |
 | `framerate`           | `30`                 | Normalized output framerate                                              |

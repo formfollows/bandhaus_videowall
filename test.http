@@ -25,6 +25,16 @@ content-type: application/json
 
 ###
 
+### Auf Berg-Video umschalten
+PUT {{host}}/program HTTP/1.1
+content-type: application/json
+
+{
+    "source": "berg"
+}
+
+###
+
 ### Fehlerfall: unbekannte Quelle (erwartet 404)
 PUT {{host}}/program HTTP/1.1
 content-type: application/json

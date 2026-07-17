@@ -155,6 +155,12 @@ class VideoSwitcher:
         )
 
     def _add_source(self, name: str, url: str) -> None:
+        if url.startswith("srt://"):
+            self._add_srt_source(name, url)
+        else:
+            self._add_file_source(name, url)
+
+    def _add_srt_source(self, name: str, url: str) -> None:
         # Feste Pipeline statt uridecodebin: uridecodebin würde autoplugin
         # und dabei ggf. einen Software-H265-Decoder wählen. Erzwingt
         # stattdessen genau die Kette, die sich im Test als funktionierend
@@ -240,6 +246,104 @@ class VideoSwitcher:
         source.connect("caller-removed", on_caller_removed)
         demux.connect("pad-added", on_pad_added)
         demux.connect("pad-removed", on_pad_removed)
+
+    def _add_file_source(self, name: str, path: str) -> None:
+        # uridecodebin statt fester Demux/Decoder-Kette: anders als bei den
+        # SRT-Quellen ist der Codec einer beliebigen mp4-Datei nicht
+        # vorhersehbar, daher wird hier bewusst autogeplugt.
+        uri = path if "://" in path else Gst.filename_to_uri(os.path.abspath(path))
+
+        decodebin = Gst.ElementFactory.make("uridecodebin", f"source-{name}")
+        convert = Gst.ElementFactory.make("videoconvert", f"convert-{name}")
+        scale = Gst.ElementFactory.make("videoscale", f"scale-{name}")
+        rate = Gst.ElementFactory.make("videorate", f"rate-{name}")
+        capsfilter = Gst.ElementFactory.make("capsfilter", f"caps-{name}")
+        # Der gemeinsame Sink läuft mit sync=false (siehe __init__, wegen der
+        # SRT-Quellen), daher würde eine Datei-Quelle sonst ungebremst so
+        # schnell abgespielt, wie decodebin Frames liefern kann. identity mit
+        # sync=true bremst diesen Zweig unabhängig davon auf Echtzeit runter,
+        # anhand der eigenen Buffer-Timestamps und der Pipeline-Clock.
+        pacer = Gst.ElementFactory.make("identity", f"pacer-{name}")
+
+        elements = (decodebin, convert, scale, rate, capsfilter, pacer)
+
+        if not all(elements):
+            raise RuntimeError(f"Elemente für {name} konnten nicht erstellt werden")
+
+        decodebin.set_property("uri", uri)
+        capsfilter.set_property("caps", self.settings.caps)
+        pacer.set_property("sync", True)
+
+        for element in elements:
+            self.pipeline.add(element)
+
+        convert.link(scale)
+        scale.link(rate)
+        rate.link(capsfilter)
+        capsfilter.link(pacer)
+
+        selector_pad = self.selector.request_pad_simple("sink_%u")
+        source_pad = pacer.get_static_pad("src")
+
+        if selector_pad is None or source_pad is None:
+            raise RuntimeError(f"Selector-Pad für {name} fehlt")
+
+        if source_pad.link(selector_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"{name} konnte nicht mit Selector verbunden werden")
+
+        self.selector_pads[name] = selector_pad
+
+        # Datei-Quellen sind endlich: statt die Wiedergabe am EOS enden zu
+        # lassen (was, wenn diese Quelle gerade aktiv ist, über den Selector
+        # bis zu den Sinks durchschlägt und die ganze Pipeline auf EOS
+        # setzt), wird das EOS-Event direkt an dieser Pad-Probe abgefangen
+        # und verworfen, und die Quelle stattdessen zum Anfang zurückgesetzt.
+        # Das funktioniert unabhängig davon, ob die Quelle gerade aktiv
+        # (sichtbar) oder nur im Hintergrund am Loopen ist.
+        def do_seek() -> bool:
+            decodebin.seek_simple(
+                Gst.Format.TIME,
+                Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                0,
+            )
+            return GLib.SOURCE_REMOVE
+
+        def on_eos_probe(_pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+            event = info.get_event()
+
+            if event.type != Gst.EventType.EOS:
+                return Gst.PadProbeReturn.OK
+
+            logger.info("Datei-Quelle '%s' beendet, starte Loop neu", name)
+            # Der Seek darf nicht synchron aus der Probe heraus aufgerufen
+            # werden: die Probe läuft im Streaming-Thread der Quelle, und
+            # genau dieser Thread muss den durch den Seek ausgelösten
+            # Flush verarbeiten. Ein blockierender Aufruf hier würde sich
+            # selbst blockieren (die Datei würde nur einmal abgespielt).
+            GLib.idle_add(do_seek)
+            return Gst.PadProbeReturn.DROP
+
+        source_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, on_eos_probe)
+
+        def on_pad_added(_element: Gst.Element, pad: Gst.Pad) -> None:
+            caps = pad.get_current_caps() or pad.query_caps(None)
+            sink_pad = convert.get_static_pad("sink")
+
+            if caps.to_string().startswith("video/") and not sink_pad.is_linked():
+                logger.info("Datei-Quelle '%s' spielt (%s)", name, caps.to_string())
+                pad.link(sink_pad)
+                return
+
+            # Andere Streams (z. B. Audio) müssen abgeführt werden, sonst
+            # blockiert decodebin intern auf dem ungenutzten Pad.
+            drain = Gst.ElementFactory.make("fakesink", f"drain-{name}-{pad.get_name()}")
+            drain.set_property("sync", False)
+            drain.set_property("async", False)
+            self.pipeline.add(drain)
+            drain.sync_state_with_parent()
+            pad.link(drain.get_static_pad("sink"))
+
+        decodebin.connect("pad-added", on_pad_added)
 
     def start(self) -> None:
         result = self.pipeline.set_state(Gst.State.PLAYING)
