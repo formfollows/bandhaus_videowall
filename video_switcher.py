@@ -21,18 +21,18 @@ class VideoSettings(BaseModel):
 
     # Auf einem Raspberry Pi oder Wayland-System gegebenenfalls ersetzen,
     # z. B. durch kmssink, waylandsink oder glimagesink.
-    sink: str = "autovideosink"
-    width: int = 1920
-    height: int = 1080
+    sink: str = "kmssink"
+    width: int = 1280
+    height: int = 720
     framerate: int = 30
 
     screenshot_path: str = "screenshot.png"
-    screenshot_interval: int = 10
+    screenshot_interval: int | None = None
 
     @property
     def caps(self) -> Gst.Caps:
         return Gst.Caps.from_string(
-            f"video/x-raw,width={self.width},height={self.height},"
+            f"video/x-raw,format=I420,width={self.width},height={self.height},"
             f"framerate={self.framerate}/1"
         )
 
@@ -68,6 +68,14 @@ class VideoSwitcher:
 
         if not all(elements):
             raise RuntimeError("Benötigte GStreamer-Elemente fehlen")
+
+        # kmssink defaults to sync=true, which waits for buffers to reach
+        # their pipeline-clock timestamp before displaying them. With a live
+        # SRT source that clock can drift/jitter enough that frames are
+        # never released, so nothing appears on HDMI even though the
+        # pipeline otherwise runs fine.
+        if self.sink.find_property("sync") is not None:
+            self.sink.set_property("sync", False)
 
         self.screenshot_capsfilter.set_property(
             "caps", Gst.Caps.from_string("video/x-raw,format=RGB")
@@ -106,11 +114,14 @@ class VideoSwitcher:
 
         self.selector_pads: dict[str, Gst.Pad] = {}
         self._screenshot_timer_id: int | None = None
+        self._srt_sources: dict[str, Gst.Element] = {}
+        self._stats_timer_id: int | None = None
 
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", self._on_bus_error)
         bus.connect("message::warning", self._on_bus_warning)
+        bus.connect("message::latency", self._on_bus_latency)
 
         for name, url in self.settings.sources.items():
             self._add_source(name, url)
@@ -132,18 +143,43 @@ class VideoSwitcher:
         warn, debug = message.parse_warning()
         logger.warning("GStreamer-Warnung von %s: %s (%s)", message.src.get_name(), warn.message, debug)
 
+    def _on_bus_latency(self, _bus: Gst.Bus, _message: Gst.Message) -> None:
+        query = Gst.Query.new_latency()
+
+        if not self.pipeline.query(query):
+            return
+
+        live, min_latency, max_latency = query.parse_latency()
+        logger.info(
+            "Pipeline-Latenz neu berechnet: live=%s min=%.1fms max=%s",
+            live,
+            min_latency / Gst.MSECOND,
+            f"{max_latency / Gst.MSECOND:.1f}ms" if max_latency != Gst.CLOCK_TIME_NONE else "unbegrenzt",
+        )
+
     def _add_source(self, name: str, url: str) -> None:
-        source = Gst.ElementFactory.make("uridecodebin", f"source-{name}")
+        # Feste Pipeline statt uridecodebin: uridecodebin würde autoplugin
+        # und dabei ggf. einen Software-H265-Decoder wählen. Erzwingt
+        # stattdessen genau die Kette, die sich im Test als funktionierend
+        # erwiesen hat (srtsrc -> tsdemux -> h265parse -> v4l2slh265dec).
+        source = Gst.ElementFactory.make("srtsrc", f"source-{name}")
+        demux = Gst.ElementFactory.make("tsdemux", f"demux-{name}")
+        parse = Gst.ElementFactory.make("h265parse", f"parse-{name}")
+        decoder = Gst.ElementFactory.make("v4l2slh265dec", f"decoder-{name}")
         queue = Gst.ElementFactory.make("queue", f"queue-{name}")
         convert = Gst.ElementFactory.make("videoconvert", f"convert-{name}")
         scale = Gst.ElementFactory.make("videoscale", f"scale-{name}")
         rate = Gst.ElementFactory.make("videorate", f"rate-{name}")
         capsfilter = Gst.ElementFactory.make("capsfilter", f"caps-{name}")
 
-        if not all((source, queue, convert, scale, rate, capsfilter)):
+        elements = (source, demux, parse, decoder, queue, convert, scale, rate, capsfilter)
+
+        if not all(elements):
             raise RuntimeError(f"Elemente für {name} konnten nicht erstellt werden")
 
         source.set_property("uri", url)
+        source.set_property("keep-listening", True)
+        demux.set_property("latency", 0)
         self._make_low_latency(queue)
 
         # Alle Eingänge werden auf dasselbe Format normalisiert.
@@ -152,9 +188,14 @@ class VideoSwitcher:
         # framerate der Ziel-Caps negotiaten können.
         capsfilter.set_property("caps", self.settings.caps)
 
-        for element in (source, queue, convert, scale, rate, capsfilter):
+        for element in elements:
             self.pipeline.add(element)
 
+        if not source.link(demux):
+            raise RuntimeError(f"{name} konnte nicht mit tsdemux verbunden werden")
+
+        parse.link(decoder)
+        decoder.link(queue)
         queue.link(convert)
         convert.link(scale)
         scale.link(rate)
@@ -170,6 +211,7 @@ class VideoSwitcher:
             raise RuntimeError(f"{name} konnte nicht mit Selector verbunden werden")
 
         self.selector_pads[name] = selector_pad
+        self._srt_sources[name] = source
 
         def on_caller_added(_element: Gst.Element, _sock_id: int, address) -> None:
             host = address.get_address().to_string()
@@ -179,27 +221,8 @@ class VideoSwitcher:
             host = address.get_address().to_string()
             logger.info("Source '%s' disconnected from %s:%d", name, host, address.get_port())
 
-        def on_source_setup(_element: Gst.Element, source_element: Gst.Element) -> None:
-            try:
-                source_element.connect("caller-added", on_caller_added)
-                source_element.connect("caller-removed", on_caller_removed)
-            except TypeError:
-                pass
-
-        def on_deep_element_added(
-            _bin: Gst.Bin, _sub_bin: Gst.Bin, element: Gst.Element
-        ) -> None:
-            factory = element.get_factory()
-
-            if factory is None or "Codec/Decoder/Video" not in factory.get_klass():
-                return
-
-            factory_name = factory.get_name()
-            backend = "hardware" if factory_name.startswith("v4l2sl") else "software"
-            logger.info("Source '%s' using %s decoder: %s", name, backend, factory_name)
-
-        def on_pad_added(element: Gst.Element, pad: Gst.Pad) -> None:
-            sink_pad = queue.get_static_pad("sink")
+        def on_pad_added(_element: Gst.Element, pad: Gst.Pad) -> None:
+            sink_pad = parse.get_static_pad("sink")
 
             if sink_pad is None or sink_pad.is_linked():
                 return
@@ -210,16 +233,16 @@ class VideoSwitcher:
                 logger.info("Source '%s' streaming (%s)", name, caps.to_string())
                 pad.link(sink_pad)
 
-        def on_pad_removed(element: Gst.Element, pad: Gst.Pad) -> None:
-            sink_pad = queue.get_static_pad("sink")
+        def on_pad_removed(_element: Gst.Element, pad: Gst.Pad) -> None:
+            sink_pad = parse.get_static_pad("sink")
 
             if sink_pad is not None and sink_pad.get_peer() == pad:
                 pad.unlink(sink_pad)
 
-        source.connect("source-setup", on_source_setup)
-        source.connect("pad-added", on_pad_added)
-        source.connect("pad-removed", on_pad_removed)
-        source.connect("deep-element-added", on_deep_element_added)
+        source.connect("caller-added", on_caller_added)
+        source.connect("caller-removed", on_caller_removed)
+        demux.connect("pad-added", on_pad_added)
+        demux.connect("pad-removed", on_pad_removed)
 
     def start(self) -> None:
         result = self.pipeline.set_state(Gst.State.PLAYING)
@@ -227,16 +250,30 @@ class VideoSwitcher:
         if result == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("GStreamer-Pipeline konnte nicht starten")
 
-        self._screenshot_timer_id = GLib.timeout_add_seconds(
-            self.settings.screenshot_interval, self._capture_screenshot
-        )
+        if self.settings.screenshot_interval is not None:
+            self._screenshot_timer_id = GLib.timeout_add_seconds(
+                self.settings.screenshot_interval, self._capture_screenshot
+            )
+
+        self._stats_timer_id = GLib.timeout_add_seconds(5, self._log_srt_stats)
 
     def stop(self) -> None:
         if self._screenshot_timer_id is not None:
             GLib.source_remove(self._screenshot_timer_id)
             self._screenshot_timer_id = None
 
+        if self._stats_timer_id is not None:
+            GLib.source_remove(self._stats_timer_id)
+            self._stats_timer_id = None
+
         self.pipeline.set_state(Gst.State.NULL)
+
+    def _log_srt_stats(self) -> bool:
+        for name, source_element in self._srt_sources.items():
+            stats = source_element.get_property("stats")
+            logger.info("Source '%s' SRT stats: %s", name, stats.to_string())
+
+        return True
 
     def _capture_screenshot(self) -> bool:
         sample = self.screenshot_sink.emit("try-pull-sample", Gst.SECOND)
