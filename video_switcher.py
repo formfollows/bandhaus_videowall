@@ -112,6 +112,8 @@ class VideoSwitcher:
         self.selector_pads: dict[str, Gst.Pad] = {}
         self._screenshot_timer_id: int | None = None
         self._srt_sources: dict[str, Gst.Element] = {}
+        self._file_sources: dict[str, Gst.Element] = {}
+        self._active_source: str | None = None
         self._stats_timer_id: int | None = None
 
         bus = self.pipeline.get_bus()
@@ -122,6 +124,24 @@ class VideoSwitcher:
 
         for name, url in self.settings.sources.items():
             self._add_source(name, url)
+
+        # input-selector wählt ohne explizite Auswahl automatisch den zuerst
+        # angeforderten Pad als aktiv. Datei-Quellen sollen aber nur laufen,
+        # während sie ausgewählt sind (siehe _add_file_source) - falls eine
+        # davon dieser initiale Pad ist, muss sie entsprechend freigegeben
+        # und gestartet werden, statt pausiert zu bleiben.
+        active_pad = self.selector.get_property("active-pad")
+
+        for name, pad in self.selector_pads.items():
+            if pad == active_pad:
+                self._active_source = name
+                element = self._file_sources.get(name)
+
+                if element is not None:
+                    element.set_locked_state(False)
+                    element.set_state(Gst.State.PLAYING)
+
+                break
 
     @staticmethod
     def _make_low_latency(queue: Gst.Element) -> None:
@@ -292,6 +312,16 @@ class VideoSwitcher:
             raise RuntimeError(f"{name} konnte nicht mit Selector verbunden werden")
 
         self.selector_pads[name] = selector_pad
+        self._file_sources[name] = decodebin
+
+        # Datei-Quellen sollen nur laufen, während sie als Programm-Quelle
+        # ausgewählt sind. Der Zweig wird deshalb standardmäßig pausiert und
+        # von automatischen Pipeline-weiten Zustandswechseln abgekoppelt
+        # (locked-state) - switch() übernimmt Freigabe/Pause beim Umschalten.
+        # Falls diese Quelle der initial aktive Selector-Pad ist, wird das
+        # am Ende von __init__ wieder rückgängig gemacht.
+        decodebin.set_locked_state(True)
+        decodebin.set_state(Gst.State.PAUSED)
 
         # Datei-Quellen sind endlich: statt die Wiedergabe am EOS enden zu
         # lassen (was, wenn diese Quelle gerade aktiv ist, über den Selector
@@ -422,4 +452,27 @@ class VideoSwitcher:
             raise KeyError(name)
 
         # GStreamer-Objekte sollten aus dem GLib-Kontext verändert werden.
-        GLib.idle_add(self.selector.set_property, "active-pad", pad)
+        GLib.idle_add(self._apply_switch, name, pad)
+
+    def _apply_switch(self, name: str, pad: Gst.Pad) -> bool:
+        previous = self._active_source
+        self._active_source = name
+        self.selector.set_property("active-pad", pad)
+
+        if previous != name:
+            previous_element = self._file_sources.get(previous) if previous else None
+
+            if previous_element is not None:
+                previous_element.set_state(Gst.State.PAUSED)
+                previous_element.set_locked_state(True)
+
+            new_element = self._file_sources.get(name)
+
+            if new_element is not None:
+                new_element.set_locked_state(False)
+                new_element.seek_simple(
+                    Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0
+                )
+                new_element.set_state(Gst.State.PLAYING)
+
+        return GLib.SOURCE_REMOVE
