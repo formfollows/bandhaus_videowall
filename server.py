@@ -18,8 +18,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 VIDEO_SETTINGS = VideoSettings(
     sources={
-        "iphone": "srt://0.0.0.0:6001?mode=listener",
+        # latency= is the receiver's requested SRT TSBPD delay in ms; the
+        # effective delay is the max of this and whatever the sender (the
+        # iPhone streaming app) requests, so lowering this only helps if the
+        # sender isn't already asking for more.
+        "iphone": "srt://0.0.0.0:6001?mode=listener&latency=120",
     },
+    # Direct KMS/DRM output; avoids autovideosink guessing a GL/Wayland sink
+    # that isn't available on a headless console.
+    sink="kmssink",
 )
 
 

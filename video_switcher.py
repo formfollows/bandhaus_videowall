@@ -77,6 +77,13 @@ class VideoSwitcher:
         self.screenshot_sink.set_property("max-buffers", 1)
         self.screenshot_sink.set_property("drop", True)
 
+        # Default queues are leaky=no (blocking, never drops): if the
+        # pipeline ever briefly falls behind live (network hiccup, decoder
+        # stall), the backlog is never shed and playback keeps lagging by
+        # that amount indefinitely. leaky=downstream drops the oldest
+        # buffered frame instead, so the queue catches back up to live.
+        self._make_low_latency(self.display_queue)
+
         for element in elements[1:]:
             self.pipeline.add(element)
 
@@ -109,6 +116,13 @@ class VideoSwitcher:
             self._add_source(name, url)
 
     @staticmethod
+    def _make_low_latency(queue: Gst.Element) -> None:
+        queue.set_property("leaky", 2)  # GST_QUEUE_LEAK_DOWNSTREAM
+        queue.set_property("max-size-buffers", 5)
+        queue.set_property("max-size-bytes", 0)
+        queue.set_property("max-size-time", 0)
+
+    @staticmethod
     def _on_bus_error(_bus: Gst.Bus, message: Gst.Message) -> None:
         err, debug = message.parse_error()
         logger.error("GStreamer-Fehler von %s: %s (%s)", message.src.get_name(), err.message, debug)
@@ -130,6 +144,7 @@ class VideoSwitcher:
             raise RuntimeError(f"Elemente für {name} konnten nicht erstellt werden")
 
         source.set_property("uri", url)
+        self._make_low_latency(queue)
 
         # Alle Eingänge werden auf dasselbe Format normalisiert.
         # videorate wird benötigt, da Quellen mit variabler Framerate (z. B.
@@ -171,6 +186,18 @@ class VideoSwitcher:
             except TypeError:
                 pass
 
+        def on_deep_element_added(
+            _bin: Gst.Bin, _sub_bin: Gst.Bin, element: Gst.Element
+        ) -> None:
+            factory = element.get_factory()
+
+            if factory is None or "Codec/Decoder/Video" not in factory.get_klass():
+                return
+
+            factory_name = factory.get_name()
+            backend = "hardware" if factory_name.startswith("v4l2sl") else "software"
+            logger.info("Source '%s' using %s decoder: %s", name, backend, factory_name)
+
         def on_pad_added(element: Gst.Element, pad: Gst.Pad) -> None:
             sink_pad = queue.get_static_pad("sink")
 
@@ -192,6 +219,7 @@ class VideoSwitcher:
         source.connect("source-setup", on_source_setup)
         source.connect("pad-added", on_pad_added)
         source.connect("pad-removed", on_pad_removed)
+        source.connect("deep-element-added", on_deep_element_added)
 
     def start(self) -> None:
         result = self.pipeline.set_state(Gst.State.PLAYING)
