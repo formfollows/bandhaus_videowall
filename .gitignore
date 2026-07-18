@@ -65,3 +65,4 @@ dmypy.json
 .DS_Store
 screenshot.png
 videos/berg.MP4
+*.log

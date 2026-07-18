@@ -125,3 +125,7 @@ Returns `404` if the requested source name isn't configured.
 Periodic screenshots are off by default (`screenshot_interval=None`). When set to a number of seconds, the currently active program output is captured on that interval and written as a PNG to `screenshot_path` (the file is overwritten in place). If no source is currently streaming into the active pad, the capture is skipped and logged (`Screenshot übersprungen: kein Frame verfügbar (Quelle aktiv?)`).
 
 There is no HTTP endpoint to fetch the screenshot yet.
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for planned features and future direction.

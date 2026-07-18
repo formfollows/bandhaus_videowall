@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 
 import gi
 from fastapi import FastAPI, HTTPException
@@ -14,7 +15,16 @@ from gi.repository import GLib
 from video_switcher import VideoSettings, VideoSwitcher
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        # 10MB * 5 Dateien, damit ein längerer Testlauf (wiederholtes
+        # Umschalten) nicht unbegrenzt wächst, aber genug Historie behält.
+        RotatingFileHandler("licht.log", maxBytes=10_000_000, backupCount=5),
+    ],
+)
 
 VIDEO_SETTINGS = VideoSettings(
     sources={
@@ -23,7 +33,7 @@ VIDEO_SETTINGS = VideoSettings(
         # iPhone streaming app) requests, so lowering this only helps if the
         # sender isn't already asking for more.
         "iphone": "srt://0.0.0.0:6001?mode=listener&latency=120",
-        "ipad": "srt://0.0.0.0:6002?mode=listener&latency=120",
+        #"ipad": "srt://0.0.0.0:6002?mode=listener&latency=120",
         "berg": "videos/berg_h265.mp4",
     },
     # Direct KMS/DRM output; avoids autovideosink guessing a GL/Wayland sink

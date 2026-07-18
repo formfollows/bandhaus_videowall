@@ -40,6 +40,14 @@ class VideoSwitcher:
 
         self.pipeline = Gst.Pipeline.new("video-switcher")
         self.selector = Gst.ElementFactory.make("input-selector", "selector")
+        # Default (true) synchronisiert inaktive Pads auf die Running-Time
+        # des aktiven Streams. Die Datei-Quelle loopt per Flushing-Seek
+        # (siehe _add_file_source/on_eos_probe) und verwirrt dabei
+        # offenbar die interne Segment-/Running-Time-Buchhaltung des
+        # Selectors so, dass ein danach reaktivierter Live-Pad dauerhaft
+        # blockiert, statt Buffer durchzulassen (Symptom: Decoder liefert
+        # weiter Bilder, aber am Selector-Ausgang kommt nichts mehr an).
+        self.selector.set_property("sync-streams", False)
         self.convert = Gst.ElementFactory.make("videoconvert", "output-convert")
         self.tee = Gst.ElementFactory.make("tee", "output-tee")
         self.display_queue = Gst.ElementFactory.make("queue", "display-queue")
@@ -194,8 +202,12 @@ class VideoSwitcher:
         scale = Gst.ElementFactory.make("videoscale", f"scale-{name}")
         rate = Gst.ElementFactory.make("videorate", f"rate-{name}")
         capsfilter = Gst.ElementFactory.make("capsfilter", f"caps-{name}")
+        # input-selector erwartet laut GStreamer-Dokumentation eine eigene
+        # Queue direkt vor jedem Sink-Pad, um den Branch-Thread vom
+        # Pad-Switch/Flush-Handling des Selectors zu entkoppeln.
+        selector_queue = Gst.ElementFactory.make("queue", f"selector-queue-{name}")
 
-        elements = (source, demux, parse, decoder, queue, convert, scale, rate, capsfilter)
+        elements = (source, demux, parse, decoder, queue, convert, scale, rate, capsfilter, selector_queue)
 
         if not all(elements):
             raise RuntimeError(f"Elemente für {name} konnten nicht erstellt werden")
@@ -204,6 +216,7 @@ class VideoSwitcher:
         source.set_property("keep-listening", True)
         demux.set_property("latency", 0)
         self._make_low_latency(queue)
+        self._make_low_latency(selector_queue)
 
         # Alle Eingänge werden auf dasselbe Format normalisiert.
         # videorate wird benötigt, da Quellen mit variabler Framerate (z. B.
@@ -223,9 +236,10 @@ class VideoSwitcher:
         convert.link(scale)
         scale.link(rate)
         rate.link(capsfilter)
+        capsfilter.link(selector_queue)
 
         selector_pad = self.selector.request_pad_simple("sink_%u")
-        source_pad = capsfilter.get_static_pad("src")
+        source_pad = selector_queue.get_static_pad("src")
 
         if selector_pad is None or source_pad is None:
             raise RuntimeError(f"Selector-Pad für {name} fehlt")
@@ -284,8 +298,12 @@ class VideoSwitcher:
         # sync=true bremst diesen Zweig unabhängig davon auf Echtzeit runter,
         # anhand der eigenen Buffer-Timestamps und der Pipeline-Clock.
         pacer = Gst.ElementFactory.make("identity", f"pacer-{name}")
+        # input-selector erwartet laut GStreamer-Dokumentation eine eigene
+        # Queue direkt vor jedem Sink-Pad, um den Branch-Thread vom
+        # Pad-Switch/Flush-Handling des Selectors zu entkoppeln.
+        selector_queue = Gst.ElementFactory.make("queue", f"selector-queue-{name}")
 
-        elements = (decodebin, convert, scale, rate, capsfilter, pacer)
+        elements = (decodebin, convert, scale, rate, capsfilter, pacer, selector_queue)
 
         if not all(elements):
             raise RuntimeError(f"Elemente für {name} konnten nicht erstellt werden")
@@ -293,6 +311,7 @@ class VideoSwitcher:
         decodebin.set_property("uri", uri)
         capsfilter.set_property("caps", self.settings.caps)
         pacer.set_property("sync", True)
+        self._make_low_latency(selector_queue)
 
         for element in elements:
             self.pipeline.add(element)
@@ -301,9 +320,10 @@ class VideoSwitcher:
         scale.link(rate)
         rate.link(capsfilter)
         capsfilter.link(pacer)
+        pacer.link(selector_queue)
 
         selector_pad = self.selector.request_pad_simple("sink_%u")
-        source_pad = pacer.get_static_pad("src")
+        source_pad = selector_queue.get_static_pad("src")
 
         if selector_pad is None or source_pad is None:
             raise RuntimeError(f"Selector-Pad für {name} fehlt")
@@ -332,15 +352,46 @@ class VideoSwitcher:
         # Das funktioniert unabhängig davon, ob die Quelle gerade aktiv
         # (sichtbar) oder nur im Hintergrund am Loopen ist.
         def do_seek() -> bool:
-            decodebin.seek_simple(
+            ok, position = decodebin.query_position(Gst.Format.TIME)
+            logger.info(
+                "Datei-Quelle '%s': Seek auf 0 wird ausgefuehrt (aktuelle Position: %s)",
+                name,
+                f"{position / Gst.SECOND:.3f}s" if ok else "unbekannt",
+            )
+            result = decodebin.seek_simple(
                 Gst.Format.TIME,
                 Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
                 0,
             )
+            logger.info("Datei-Quelle '%s': seek_simple() ergab %s", name, result)
             return GLib.SOURCE_REMOVE
 
         def on_eos_probe(_pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
             event = info.get_event()
+
+            # FLUSH_START/FLUSH_STOP verwerfen: der Seek in do_seek() braucht
+            # FLUSH, damit decodebin intern (Demuxer/Decoder) seinen
+            # EOS-Zustand sauber zuruecksetzt - ohne FLUSH bleibt die Quelle
+            # nach dem ersten Loop dauerhaft "zu Ende" und liefert nie wieder
+            # Bilder. Laesst man das FLUSH_START/STOP-Paar aber bis zum
+            # Selector durchlaufen, waehrend dieser Zweig gerade der aktive
+            # Pad ist, reisst es den gemeinsamen Ausgang (output-convert/
+            # tee/sink) mit. Schaltet die Pipeline kurz danach auf eine
+            # Live-Quelle zurueck, bleibt deren eigener, nie geflushter
+            # Zweig gegenueber dem frisch geflushten gemeinsamen Ausgang
+            # inkonsistent - ihre Buffer werden ab dann dauerhaft und ohne
+            # Fehlermeldung verworfen (beobachtet: Live-Bild friert nach dem
+            # Zurueckschalten komplett ein). Der Flush bleibt hier deshalb
+            # auf diesen Zweig beschraenkt: intern (oberhalb dieser Probe)
+            # laeuft er normal durch und setzt decodebin zurueck, unterhalb
+            # (Richtung Selector) wird er abgefangen.
+            if event.type in (Gst.EventType.FLUSH_START, Gst.EventType.FLUSH_STOP):
+                logger.info(
+                    "Datei-Quelle '%s': %s an Selector-Grenze abgefangen",
+                    name,
+                    event.type.value_nick,
+                )
+                return Gst.PadProbeReturn.DROP
 
             if event.type != Gst.EventType.EOS:
                 return Gst.PadProbeReturn.OK
@@ -354,7 +405,22 @@ class VideoSwitcher:
             GLib.idle_add(do_seek)
             return Gst.PadProbeReturn.DROP
 
-        source_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, on_eos_probe)
+        # EVENT_DOWNSTREAM allein faengt laut GStreamer keine
+        # Flush-Events ab ("events that are not flushing") - dafuer
+        # extra EVENT_FLUSH, sonst laeuft der FLUSH_START/STOP-Abfang
+        # oben ins Leere und die Events erreichen ungebremst den Selector.
+        source_pad.add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM | Gst.PadProbeType.EVENT_FLUSH,
+            on_eos_probe,
+        )
+
+        # decodebin baut bei jeder Auswahl (NULL -> PLAYING) seine interne
+        # Decode-Kette komplett neu auf, pad-added feuert dabei jedes Mal
+        # erneut. Drains für Nicht-Video-Pads (z. B. Audio) werden deshalb
+        # pro Pad verfolgt und beim zugehörigen pad-removed wieder
+        # abgebaut - sonst sammelt sich bei jedem Umschaltzyklus ein
+        # weiteres, nie freigegebenes fakesink-Element in der Pipeline an.
+        drains: dict[str, Gst.Element] = {}
 
         def on_pad_added(_element: Gst.Element, pad: Gst.Pad) -> None:
             caps = pad.get_current_caps() or pad.query_caps(None)
@@ -373,8 +439,23 @@ class VideoSwitcher:
             self.pipeline.add(drain)
             drain.sync_state_with_parent()
             pad.link(drain.get_static_pad("sink"))
+            drains[pad.get_name()] = drain
+
+        def on_pad_removed(_element: Gst.Element, pad: Gst.Pad) -> None:
+            sink_pad = convert.get_static_pad("sink")
+
+            if sink_pad is not None and sink_pad.get_peer() == pad:
+                pad.unlink(sink_pad)
+                return
+
+            drain = drains.pop(pad.get_name(), None)
+
+            if drain is not None:
+                drain.set_state(Gst.State.NULL)
+                self.pipeline.remove(drain)
 
         decodebin.connect("pad-added", on_pad_added)
+        decodebin.connect("pad-removed", on_pad_removed)
 
     def start(self) -> None:
         result = self.pipeline.set_state(Gst.State.PLAYING)
@@ -470,7 +551,7 @@ class VideoSwitcher:
                 # Hardware ohnehin nur begrenzt viele gleichzeitige
                 # HEVC-Decode-Sessions erlaubt (die beiden SRT-Kameras
                 # belegen bereits je eine).
-                previous_element.set_state(Gst.State.NULL)
+                self._set_state_checked(previous_element, Gst.State.NULL, previous)
                 previous_element.set_locked_state(True)
 
             new_element = self._file_sources.get(name)
@@ -480,6 +561,33 @@ class VideoSwitcher:
                 # decodebin die Decode-Kette komplett neu auf und beginnt
                 # ohnehin bei Position 0.
                 new_element.set_locked_state(False)
-                new_element.set_state(Gst.State.PLAYING)
+                self._set_state_checked(new_element, Gst.State.PLAYING, name)
 
         return GLib.SOURCE_REMOVE
+
+    @staticmethod
+    def _set_state_checked(element: Gst.Element, state: Gst.State, label: str) -> None:
+        result = element.set_state(state)
+
+        if result == Gst.StateChangeReturn.FAILURE:
+            logger.error("Zustandswechsel für '%s' auf %s fehlgeschlagen", label, state.value_nick)
+            return
+
+        if state != Gst.State.NULL:
+            return
+
+        # set_state(NULL) sollte laut GStreamer-Semantik synchron
+        # abschließen, aber erst get_state() bestätigt das wirklich. Relevant
+        # hier, weil der v4l2-Hardware-Decoder sein Gerät und seine Puffer
+        # erst nach vollständigem Abschluss freigibt und sich beide
+        # Live-Quellen denselben begrenzten Pool gleichzeitiger
+        # HEVC-Decode-Sessions teilen - ein unvollständiger Teardown einer
+        # Datei-Quelle kann sich damit auf die Live-Quellen auswirken.
+        change_return, _, _ = element.get_state(5 * Gst.SECOND)
+
+        if change_return != Gst.StateChangeReturn.SUCCESS:
+            logger.warning(
+                "Zustandswechsel für '%s' auf NULL nicht sauber abgeschlossen (%s)",
+                label,
+                change_return.value_nick,
+            )
